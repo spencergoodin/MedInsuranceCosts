@@ -1,0 +1,533 @@
+---
+title: "Insurance Cost Prediction Modeling"
+author: "Spencer Goodin"
+date: "2023-10-31"
+output:
+  html_document:
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# Installing and loading required libraries
+# install.packages('dplyr')
+# install.packages('ggplot2')
+# install.packages('lmtest')
+# install.packages('car')
+# install.packages('moments')
+# install.packages('DHARMa')
+# install.packages('knitr')
+# install.packages('broom')
+# install.packages('modelsummary')
+# install.packages('scales')
+# install.packages('kableExtra')
+
+library('dplyr')
+library('ggplot2')
+library('lmtest')
+library('car')
+library('moments')
+library('DHARMa')
+library('knitr')
+library('broom')
+library('modelsummary')
+library('scales')
+library('kableExtra')
+```
+
+## Introduction
+
+***
+
+This analysis utilizes a dataset of medical insurance information to build a predictive model for total annual insurance cost based various health and lifestyle factors. The model created will provide an estimate of the extent to which each factor influences total insurance costs, and allow for the prediction of individual total cost of insurance based on these factors.
+
+The dataset utilized in this project is synthetic, and as such should not be treated as a representation of fact about the general public. It is being used for demonstrative purposes only. The data is licensed under Open Data Commons' _Database Contents License v1.0_, and is available from a number of sources, including:
+
+Kaggle.com: https://www.kaggle.com/datasets/mirichoi0218/insurance/data
+
+GitHub.com: https://github.com/stedy/Machine-Learning-with-R-datasets
+
+```{r Function and Variable Definitions, collapse = TRUE}
+fitModel <- setRefClass(
+  
+  'Fitted Model',
+  
+  fields = list(
+    logpredicted = 'numeric', 
+    predicted = 'numeric', 
+    observed = 'numeric', 
+    residuals = 'numeric'
+  ),
+  
+  methods = list(
+    initialize = function(model, data = test.data, log = FALSE) {
+      if (log == TRUE) {
+        logpredicted <<- predict(model, newdata = data)
+        predicted <<- exp(logpredicted)
+      }
+      else {
+        predicted <<- predict(model, newdata = data)
+      }
+      observed <<- data$charges
+      residuals <<- observed - predicted
+    },
+    # Model Root Mean Square Error
+    rmse = function(r = residuals) {
+      sqrt(mean(r**2))
+    },
+    # Model Relative Squared Error
+    rse = function(r = residuals, p = predicted, o = observed) {
+      sum(r**2)/sum((p - mean(o))**2)
+    },
+    # Model Mean Absolute Error (MAE)
+    mae = function(r = residuals) {
+      mean(abs(r))
+    },
+    # Model Relative Absolute Error (RAE)
+    rae = function(r = residuals, p = predicted, o = observed) {
+      sum(abs(r))/sum(abs(p - mean(o)))
+    },
+    allTests = function() {
+      return(as.vector(c(rmse(), rse(), mae(), rae())))
+    }
+  )
+)
+
+cm = c(
+  "(Intercept)" = "Intercept", "age" = "Age", "male_dummy" = "Male", 
+  "smoker_dummy" = "Smoker", "bmi" = "BMI", 
+  "smoker_dummy:bmi" = "BMI:Smoker","children" = "Children", 
+  "sw_dummy" = "Southwest", "ne_dummy" = "Northeast", "nw_dummy" = "Northwest",
+  "north_dummy" = "North"
+)
+
+gm_single <- list(
+  list("raw" = "nobs", "clean" = "N", "fmt" = 0),
+  list("raw" = "r.squared", "clean" = "R2", "fmt" = 3),
+  list("raw" = "adj.r.squared", "clean" = "Adj. R2", "fmt" = 3)
+)
+
+gm_multiple <- list(
+  list("raw" = "nobs", "clean" = "N", "fmt" = 0),
+  list("raw" = "r.squared", "clean" = "R2", "fmt" = 3),
+  list("raw" = "adj.r.squared", "clean" = "Adj. R2", "fmt" = 3),
+  list("raw" = "rmse", "clean" = "RMSE", "fmt" = 3)
+)
+```
+
+
+## Examining and Cleaning the Dataset
+
+***
+
+The data set contains 1338 observations, with each observation having seven measures.
+
+The included measures are:
+
+- age: How old the primary beneficiary is
+- sex: Primary beneficiary's sex
+- bmi: Primary beneficiary's body mass index (BMI), a function of height and weight
+- children: Number of children covered by insurance policy
+- smoker: Whether the primary beneficiary smokes
+- region: Where the primary beneficiary lives, broken down into four categories
+- charges: Total value of annual billed insurance charges from all sources
+
+```{r Loading Dataset, collapse=TRUE}
+ins.data <- read.csv('insurance.csv')
+
+head(ins.data)
+
+apply(ins.data[c('sex','smoker','region')], 2, unique)
+```
+
+To begin validation, the dataset was checked for missing data and possible errors. The dataset appears to have no missing values; while this would normally be cause for concern, given the providence of the data as well as its synthetic origins, the data may be complete. While measures such as region and age do not have any values that are not system missing without meaningful data (e.g., 'None' for region or zero for age), the same cannot be said for certain about number of children, as a missing value entered as zero would be indistinguishable from an individual having zero children.
+
+An initial glance at the distribution of child counts seems to indicate that the sample may not be representative of the population. The population average number of children per household is just over two, while the mean number of children in our sample is just over one. However, it's important to keep in mind that only children who are beneficiaries of the insurance policy are accounted for by this measure, so it makes sense that this number would be below the average number of children per household.
+
+After verifying the completeness of the data, the dataset was sorted by value of charges to check for outlying values at the upper end of cost. While the initial summary revealed a high maximum value compared to the mean, there is a wide range of increasingly large values at the upper end of the cost scale. This suggests there may be a large positive skew, as opposed to a handful of outlying values.
+
+```{r Validity Check, collapse=TRUE}
+# Summary of measures
+summary(ins.data)
+
+# Check for system missing values
+colSums(is.na(ins.data))
+
+# Check distribution of children
+ins.data %>% count(children)
+mean(ins.data$children)
+
+# Check for outliers in charges
+head(ins.data[order(-ins.data$charges),]['charges'], 20)
+```
+
+Lastly, binary variables were re-coded to 0s and 1s, and dummy variables were created for region categories. These include:
+
+- male_dummy: sex binary re-code (0 = female, 1 = male)
+- smoker_dummy: smoker binary re-code (0 = no, 1 = yes)
+- sw_dummy, ne_dummy, and nw_dummy: region re-codes (Southeast residence signified by 0 to all)
+- north_dummy: region re-code (0 = south, 1 = north)
+
+Region was analyzed using a north/south categorization in one model, as opposed to the original four region categories. While this variable is not immediately utilized, the alternate re-code is included here for consistency.
+
+```{r Recoding and Dummies}
+# Creating dummy variables
+ins.data$male_dummy <- sapply(
+  ins.data$sex, function (x) ifelse(x == 'male', 1, 0)
+)
+ins.data$smoker_dummy <- sapply(
+  ins.data$smoker, function (x) ifelse(x == 'yes', 1, 0)
+)
+
+ins.data$sw_dummy <- ifelse(ins.data$region == 'southwest', 1, 0)
+ins.data$ne_dummy <- ifelse(ins.data$region == 'northeast', 1, 0)
+ins.data$nw_dummy <- ifelse(ins.data$region == 'northwest', 1, 0)
+
+# North/South dummy variable for trimmed models
+ins.data$north_dummy <- ifelse(
+  ins.data$region == 'northeast' | ins.data$region == 'northwest', 1, 0
+)
+```
+
+## Exploratory Analysis {.tabset}
+
+***
+
+To begin the exploratory analysis, the distribution of total cost of insurance was assessed. It is immediately apparent that there is a heavy positive skew in the distribution, which will potentially need to be addressed. Next, the linearity of the relationship between each numeric variable and cost outcomes was determined. Spearman's Rho correlation is used instead of the usual Pearson's correlation due to the high positive skew of cost.
+
+Age and BMI were found to have a moderate and weak linear correlation with insurance cost respectively. It also appears that there is a fair bit of banding in cost by age, with the main body of responses beginning around five thousand dollars, with additional bands forming around fifteen and thirty-five thousand dollars.
+
+Number of children was found to have a weak linear correlation with insurance cost. For respondents with one to four children, the median cost increase as number of children increases. This is largely in keeping with what one might expect: that as the number of dependents on an insurance policy increases, policy price and total number of physician visits would increase, driving up cost. Correlation testing indicates an increase in cost with an increase in number of children, but the distribution of cost at one and five children breaks away from this trend. This may, however, be a result of other factors. While respondents having no children have a higher median cost than those with one child, they still have a lower mean cost. Respondents with five children do not hold to the pattern of increasing cost at the median or mean, however there is also only a small selection of respondents (18) who have five children. As such, since there is an _a priori_ understanding of why these variables would be linearly related, and most observations are in line with this understanding, number of children are assumed to have a linear relationship.
+
+### Cost Skewness
+
+```{r Skewness Histogram, collapse = TRUE}
+agostino.test(ins.data$charges)
+
+ggplot(data = ins.data, aes(x=charges)) + 
+  geom_histogram(bins=63) + 
+  geom_vline(aes(xintercept=mean(charges)), 
+             color='#3366FF', 
+             linetype = 'dashed',
+             linewidth=1) +
+  labs(title = "Frequency of Total Costs",
+       subtitle = "by Thousands of Dollars",
+       x = 'Total Cost', 
+       y = 'Count') +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5))
+```
+
+Skewness: `r round(agostino.test(ins.data$charges)$statistic[1], 3)`
+
+p-value: `r pvalue(agostino.test(ins.data$charges)$p.value)`
+
+### Cost by Age
+
+```{r Charges by Age, collapse = TRUE}
+cor.test(x = ins.data$age, y = ins.data$charges, method = "spearman")
+
+ggplot(data = ins.data, aes(x=age, y=charges)) + 
+  geom_point()+
+  labs(title = "Insurance Cost by Age", 
+       x = "Age of Respondent", y = "Total Cost") +
+  theme(plot.title = element_text(hjust = 0.5)) + 
+  geom_smooth(formula = y ~ x, method = "lm", 
+              se = FALSE, fullrange = TRUE, level = 0.95)
+```
+
+Correlation: `r round(cor.test(x = ins.data$age, y = ins.data$charges, method = "spearman")$estimate, 3)` 
+
+p-value: `r pvalue(cor.test(x = ins.data$age, y = ins.data$charges, method = "spearman")$p.value)`
+
+### Cost by BMI
+
+```{r Charges by BMI, collapse = TRUE}
+cor.test(x = ins.data$bmi, y = ins.data$charges, method = "spearman")
+
+ggplot(data = ins.data, aes(x=bmi, y=charges)) + 
+  geom_point()+
+  labs(title = "Insurance Cost by BMI", 
+       x = "BMI of Respondent", 
+       y = "Total Cost") +
+  theme(plot.title = element_text(hjust = 0.5)) + 
+  geom_smooth(formula = y ~ x, method = "lm", 
+              se = FALSE, fullrange = TRUE, level = 0.95)
+```
+
+Correlation: `r round(cor.test(x = ins.data$bmi, y = ins.data$charges, method = "spearman")$estimate, 3)` 
+
+p-value: `r pvalue(cor.test(x = ins.data$bmi, y = ins.data$charges, method = "spearman")$p.value)`
+
+### Cost by Number of Children
+
+```{r Charges by Children, collapse = TRUE}
+cor.test(x = ins.data$children, y = ins.data$charges, method = "spearman")
+
+ggplot(data = ins.data, aes(group=children, x=children, y=charges)) + 
+  geom_boxplot()+
+  labs(title = "Insurance Cost by Number of Children", 
+       x = "Number of Children", 
+       y = "Total Cost") +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+Correlation: `r round(cor.test(x = ins.data$children, y = ins.data$charges, method = "spearman")$estimate, 3)` 
+
+p-value: `r pvalue(cor.test(x = ins.data$children, y = ins.data$charges, method = "spearman")$p.value)`
+
+## Regression Modeling
+
+***
+
+Before beginning analysis, the dataset is split into a training and testing subset, to allow for the assessment of model performance. 70% of the data from the main dataset is utilized for training, with 30% reserved in the testing set. This ratio will allow for a sample size large enough to satisfy normality assumptions while still providing a healthy quantity of testing data.
+
+```{r Pre-Analysis Setup}
+set.seed(123)
+ins.data$id <- 1:nrow(ins.data)
+train.data <- ins.data %>% sample_frac(0.70)
+test.data <- anti_join(ins.data, train.data, by = 'id')
+```
+
+### Multiple Linear Regression {.tabset}
+
+The first model created utilized multiple linear regression (MLR). While the high skewness of the charges measure would likely render single variable OLS regressions non-viable without transformation, MLRs are considered robust against non-normally distributed response variables. Therefore, this relatively simple model provides a solid foundation for further modeling.
+
+The model was created using the full array of predictors, with no interaction terms. After creating the model, an examination of its residuals shows that the assumption of normally distributed residuals, which underpins the accuracy of MLR models, is not met. This is one of the less impactful assumptions of MLR models, however it is still worth noting that, as a result, standard errors and significance values of model coefficients may be less accurate when extrapolated to the general population. 
+
+When plotted against the predicted values, the model residuals reveal a trend: the large gap in estimates around the \$20k cost point is likely caused by the high impact of smoking, which has the largest coefficient of all model predictors, at \$24k. There also appears to be a substantial increase in residual variance at higher cost values. This was initially thought to be the result of heteroscedasticity, however after accounting for the presence and location of the large gap in estimated costs based on smoking, it may be more likely that this increase in variance is indicative of an interaction effect between smoking and another predictor. 
+
+```{r Multiple Linear Regression Model, collapse=TRUE}
+mlr.model <- lm(charges ~ age + male_dummy + bmi + smoker_dummy + children +
+                  sw_dummy + ne_dummy + nw_dummy, 
+                data = train.data)
+```
+
+#### Model Coefficients
+
+```{r MLR Coefficients}
+modelsummary(list("Multiple Linear Regression" = mlr.model),
+             shape = term ~ statistic,
+             statistic = c('std.error', 'statistic'),
+             stars = TRUE,
+             coef_map = cm,
+             gof_map = gm_single
+             )
+```
+
+#### Residual Distribution
+
+```{r MLR Residuals}
+hist(mlr.model$residuals,
+     breaks = 20,
+     main = 'MLR Residual Distribution',
+     xlab = 'Residual')
+```
+
+#### Residuals vs Fitted
+
+```{r MLR Residuals vs Fitted}
+plot(mlr.model, which = 1, 
+     caption = NA, sub.caption = NA, 
+     main = 'MLR Residuals vs Fitted Values') 
+```
+
+### Modeling Smoker Interaction {.tabset}
+
+Determining which covariate is interacting with smoking is largely a process of trial and error, however that is not to say that there isn't an obvious starting point. While the measures in this dataset are largely unrelated, smoking and BMI are both metrics which are closely related to the health of the insurance policy's primary beneficiary. Since apart from sex the rest of the predictors are related to family and location, it seems likely that the interaction effect may be between smoking and BMI. After creating a new MLR model which accounts for interaction between smoking and BMI, the residual standard error decreases by approximately 20.5%. 
+
+The residual plot of the second MLR model still shows signs that there may be heteroscedasticity. While there is now a somewhat equal variance across the spectrum of costs, the frequency of high-error estimates seems to increase with costs. However, a Breusch-Pagan test finds that the model is not significantly heteroscedastic (p < 0.214), and two models created to negate the effects of heteroscedasticity do not significantly improve model fit (Appendix 1).
+
+```{r Smoking Interaction, collapse=TRUE}
+mlri.model <- lm(charges ~ age + male_dummy + smoker_dummy + bmi +
+                   bmi*smoker_dummy + children + sw_dummy + ne_dummy + nw_dummy, 
+                data = train.data)
+
+summary(mlri.model)
+```
+
+#### Model Coefficients
+
+```{r MLRi Coefficients}
+modelsummary(list("MLR with Smoker Interaction" = mlri.model),
+             shape = term ~ statistic,
+             statistic = c('std.error', 'statistic'),
+             stars = TRUE,
+             coef_map = cm,
+             gof_map = gm_single
+             )
+```
+
+#### Residual Distribution
+
+```{r MLRi Residuals}
+hist(mlri.model$residuals,
+     breaks = 20,
+     main = 'MLRi Residual Distribution',
+     xlab = 'Residual')
+```
+
+#### Residuals vs Fitted
+
+```{r MLRi Residuals vs Fitted}
+plot(mlri.model, which = 1, 
+     caption = NA, sub.caption = NA, 
+     main = 'MLRi Residuals vs Fitted Values') 
+```
+
+### Region Predictor Reduction
+
+In both the MLR model with the smoker-BMI interaction term and the model without, residence in the north- or southwest were found to not be significantly associated with a difference in cost compared to residents of the southeast. While residence in the northwest was found to be marginally significant (p < 0.055), it is still beyond the rejection threshold of a 95% CI. Another trend which appeared, however, was that southern regions had lower estimated insurance cost than northern regions. As such, region was recoded into north and south residence, and the model was recreated. Additionally, a model was created with no region categories.
+
+While consolidating the region categories did yield a statistically significant effect for region, the overall model accuracy decreased compared to the model with all four region categories. This was also the case for the model with region removed altogether. Defaulting to the model with the most accurate estimations, the region variable was left un-transformed despite the non-significant predictors.
+
+```{r MLR vs rMLR Model Fit Statistics, collapse = TRUE}
+rmlr.model <- lm(charges ~ age + male_dummy + smoker_dummy + bmi +
+                   smoker_dummy*bmi + children + north_dummy, 
+                data = train.data)
+
+rmlr2.model <- lm(charges ~ age + male_dummy + smoker_dummy + bmi +
+                    bmi*smoker_dummy + children,
+                  data = train.data)
+
+modelsummary(list(
+                  "Four Regions" = mlri.model, 
+                  "Two Regions" = rmlr.model,
+                  "No Regions" = rmlr2.model
+             ),
+             shape = term ~ model,
+             stars = TRUE,
+             coef_map = cm,
+             gof_map = gm_multiple
+)
+```
+
+### High Error Estimations {.tabset}
+
+While accounting for the mediation of the effect of BMI by smoking lead to substantial model fit improvements, there is still a large degree of error in some observations. Having ruled out a violation of assumptions of linear regressions, several high-error estimates were drawn from the dataset to see if they yield any indication of what trends may be causing this increase in error; these include the largest under- and overestimations for both smokers and non-smokers. While it is important to remember that these are individual observations and aren’t representative of the whole, it may still help shed some light on what is causing the overall inaccuracy.
+
+While the highest error estimate is more inaccurate for the smoker than non-smoker, a trend between both emerges wherein the model consistently underestimates more so than it overestimates. This may be indicative of factors which have not been included in the dataset, but which are influencing overall cost for these cases. In addition, in the largest cases of overestimation, the error for the smoking respondent’s cost estimate is much higher than that of the non-smoking respondent. This may be indicative that the effect of smoking is less pronounced than what the model is attributing to it; this would also explain some of the increase in variance among high-cost estimates. Again, it is important to keep in mind that this is largely speculative, however this may help inform future analysis of the subject material, and provide insight into what factors should be assessed in future data collection.
+
+```{r High Error Estimate Analysis}
+results <- data.frame(mlri.model$model)
+results$estimate <- mlri.model$fitted.values
+results$residual <- mlri.model$residuals
+
+results$male_dummy <- sapply(
+  results$male_dummy, function (x) ifelse(x == 0, "Female", "Male")
+)
+
+outlying <- data.frame(
+  "Min Non-Smoking" <- subset(results, smoker_dummy == 0) %>% 
+    subset(residual == min(results$residual[results$smoker_dummy == 0])) %>%
+    select(c(charges, estimate, residual, age, male_dummy, bmi, children)) %>%
+    t(),
+  "Max Non-Smoking" <- subset(results, smoker_dummy == 0) %>% 
+    subset(residual == max(results$residual[results$smoker_dummy == 0])) %>%
+    select(c(charges, estimate, residual, age, male_dummy, bmi, children)) %>%
+    t(),
+  "Min Smoking" <- subset(results, smoker_dummy == 1) %>% 
+    subset(residual == min(results$residual[results$smoker_dummy == 1])) %>%
+    select(c(charges, estimate, residual, age, male_dummy, bmi, children)) %>%
+    t(),
+  "Max Smoking" <- subset(results, smoker_dummy == 1) %>% 
+    subset(residual == max(results$residual[results$smoker_dummy == 1])) %>%
+    select(c(charges, estimate, residual, age, male_dummy, bmi, children)) %>%
+    t()
+)
+
+rownames(outlying) <- c("Cost","Estimate","Residual","Age","Sex","BMI","Children")
+
+kable(outlying, col.names = c("Overestimate", "Underestimate", "Overestimate", "Underestimate")) %>%
+  kable_styling(full_width = F) %>%
+  add_header_above(c(" " = 1, "Non-Smoking" = 2, "Smoking" = 2))
+```
+
+```{r Sample Means, collapse = TRUE}
+mean(train.data$bmi)
+mean(train.data$age)
+```
+
+### Model Testing {.tabset}
+
+```{r Model Fit Object Creation, collapse = TRUE}
+mlriTrainFit <- fitModel(mlri.model, data = train.data)
+mlriTestFit <- fitModel(mlri.model)
+```
+
+Following the creation of several models, a multiple linear regression with interaction between smoking and BMI was determined to be the most accurate estimator of overall insurance cost. To further assess this model, it was re-fitted against the testing data set aside at the beginning of analysis. 
+
+The model fit results for the testing data are encouraging; both the RMSE and MAE of the model fit against the test data are within 5% of those of the fit on the training data.  Additionally, a t-test of the mean residuals for both model fits confirms that there is not a significant difference of means (`r pvalue(t.test(mlriTrainFit$residuals,mlriTestFit$residuals)$p.value)`) with a confidence interval spanning zero. 
+
+
+```{r Model Testing, collapse = TRUE}
+test.metrics <- data.frame(
+  'Training' = c(mlriTrainFit$rmse(), mlriTrainFit$mae()),
+  'Testing' = c(mlriTestFit$rmse(), mlriTestFit$mae())
+)
+
+row.names(test.metrics) <- c('RMSE', 'MAE')
+
+kable(test.metrics) %>% kable_styling(full_width = F)
+```
+
+```{r Residual Means Test, collapse = TRUE}
+t.test(mlriTrainFit$residuals, mlriTestFit$residuals)
+```
+
+## Discussion
+
+***
+
+The most significant findings of the analysis pertained to the impact of smoking on overall health insurance cost. Smoking was the single largest contributor to higher insurance cost, via its mediation of the effect of BMI. While BMI alone was not found to be a significant predictor of insurance cost, the effect of BMI among smokers was the single largest influence on higher insurance cost, seeing an increase of \$1440.99 per year in insurance cost per point of BMI. 
+
+Age and number of children were also found to have significant effects on cost of insurance. On average, a one-year age increase was associated with \$254 per year in increased insurance costs. Additionally, each child covered by the policy increased average annual insurance cost by \$604. While males were estimated to pay $607 more than females for insurance annually, the effect was only marginally significant. Lastly, region did not have a significant impact on annual cost.
+
+#### Recommendations
+
+Recommendations based on this analysis depend primarily on the purposes of the stakeholder. 
+
+For individuals, the single largest factor which can help reduce annual cost of insurance is the cessation of smoking.  In addition, for both smokers and non-smokers, reducing BMI is likely the next best option. This would primarily be achieved through reduction of body weight. Unfortunately, other factors which were found to influence cost of insurance are largely beyond the control of an individual. If one _were_ to find a way to reverse aging, for instance, it is not likely they would have to worry about the price of an insurance policy.
+
+For corporate entities which may be looking to reduce employee medical coverage costs, implementation of programs which can help promote an active employee lifestyle would likely be the main avenue for cost reduction. This would be primarily through the reduction of body weight which is often associated with a more active lifestyle, and the corresponding reduction in BMI. In addition, providing support for smoking cessation may help as well. 
+
+#### Limitations and Potential Improvements
+
+Several estimates with high errors in the final model seem to indicate that factors which are not accounted for in the dataset are highly influential on some insurance costs. These are likely the result of pre-existing conditions and other similar factors which increase the total cost of coverage, emergency situations and other utilization rate factors which accrue costs extraneous to overall policy coverage price, or a combination of both. In the first case, inclusion of additional health indicators and medical history would be greatly beneficial, even in the form of somewhat generic “do you have a pre-existing medical condition such as…?” questions, or similar measures. This would allow for individuals which have complex medical histories to be controlled for. In the second case, predictors such as number of doctor’s appointments, number of prescriptions, utilization of EMS services, etc. would allow for improved accuracy by controlling for extraneous costs. Without these factors, future improvements to prediction models based on this data would likely be minimal.
+
+## Appendices
+
+```{r WLS and LogMLR Models, collapse = TRUE}
+weights <- 1/fitted( lm(abs(residuals(mlri.model)) ~ fitted(mlri.model)) )**2
+wls.model <- lm(charges ~ age + male_dummy + smoker_dummy + bmi +
+                   smoker_dummy*bmi + children + sw_dummy + ne_dummy + nw_dummy, 
+                data = train.data, 
+                weights = weights)
+
+train.data$log_charges <- log(train.data$charges)
+logmlr.model <- lm(log_charges ~ age + male_dummy + smoker_dummy + bmi +
+                    bmi*smoker_dummy + children + sw_dummy + ne_dummy + nw_dummy, 
+                data = train.data)
+
+modelsummary(list(
+                  "MLR" = mlri.model, 
+                  "WLS" = wls.model, 
+                  "Log Transformed MLR" = logmlr.model
+             ),
+             exponentiate = c(FALSE, FALSE, TRUE),
+             shape = term ~ model,
+             stars = TRUE,
+             coef_map = cm,
+             gof_map = gm_multiple,
+             title = "Appendix 1: Comparison of Heteroscedasticity Controlled Models",
+             note = paste0("Automatic calculation for RMSE on log transformed 
+             dependent variable is not in original units. After back transforming
+             the predicted values and re-calculating the residuals, log-MLR model 
+             RMSE = ", 
+             round(sqrt(mean((train.data$charges - exp(logmlr.model$fitted.values))**2)), 3), 
+             ".")
+             )
+```
+
+\
